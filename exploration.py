@@ -1,7 +1,3 @@
-#import tensorflow as tf
-#from tensorflow.keras.mixed_precision import experimental as prec
-#from tensorflow_probability import distributions as tfd
-
 import torch
 from torch import nn
 from torch import distributions as torchd
@@ -11,20 +7,16 @@ import networks
 import tools
 
 
-#class Random(tools.Module):
 class Random(nn.Module):
 
   def __init__(self, config):
     self._config = config
-    #self._float = prec.global_policy().compute_dtype
 
   def actor(self, feat):
     shape = feat.shape[:-1] + [self._config.num_actions]
     if self._config.actor_dist == 'onehot':
-      #return tools.OneHotDist(tf.zeros(shape))
       return tools.OneHotDist(torch.zeros(shape))
     else:
-      #ones = tf.ones(shape, self._float)
       ones = torch.ones(shape)
       return tools.ContDist(torchd.uniform.Uniform(-ones, ones))
 

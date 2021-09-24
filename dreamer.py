@@ -6,19 +6,10 @@ import pathlib
 import sys
 import warnings
 
-#warnings.filterwarnings('ignore', '.*box bound precision lowered.*')
-#warnings.filterwarnings('ignore', '.*TensorFloat-32 matmul/conv*')
-#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['MUJOCO_GL'] = 'egl'
 
 import numpy as np
 import ruamel.yaml as yaml
-#import tensorflow as tf
-#from tensorflow.keras.mixed_precision import experimental as prec
-
-#tf.get_logger().setLevel('ERROR')
-
-#from tensorflow_probability import distributions as tfd
 
 sys.path.append(str(pathlib.Path(__file__).parent))
 
@@ -39,17 +30,13 @@ class Dreamer(nn.Module):
     super(Dreamer, self).__init__()
     self._config = config
     self._logger = logger
-    #self._float = prec.global_policy().compute_dtype
     self._should_log = tools.Every(config.log_every)
     self._should_train = tools.Every(config.train_every)
     self._should_pretrain = tools.Once()
     self._should_reset = tools.Every(config.reset_every)
     self._should_expl = tools.Until(int(
         config.expl_until / config.action_repeat))
-    #self._metrics = collections.defaultdict(tf.metrics.Mean)
     self._metrics = {}
-    #with tf.device('cpu:0'):
-    #  self._step = tf.Variable(count_steps(config.traindir), dtype=tf.int64)
     self._step = count_steps(config.traindir)
     # Schedules.
     config.actor_entropy = (
@@ -58,30 +45,23 @@ class Dreamer(nn.Module):
         lambda x=config.actor_state_entropy: tools.schedule(x, self._step))
     config.imag_gradient_mix = (
         lambda x=config.imag_gradient_mix: tools.schedule(x, self._step))
-    #self._dataset = iter(dataset)
     self._dataset = dataset
     self._wm = models.WorldModel(self._step, config)
     self._task_behavior = models.ImagBehavior(
         config, self._wm, config.behavior_stop_grad)
-    #reward = lambda f, s, a: self._wm.heads['reward'](f).mode()
     reward = lambda f, s, a: self._wm.heads['reward'](f).mean
     self._expl_behavior = dict(
         greedy=lambda: self._task_behavior,
         random=lambda: expl.Random(config),
         plan2explore=lambda: expl.Plan2Explore(config, self._wm, reward),
     )[config.expl_behavior]()
-    # Train step to initialize variables including optimizer statistics.
-    #self._train(next(self._dataset))
 
   def __call__(self, obs, reset, state=None, reward=None, training=True):
-    #step = self._step.numpy().item()
     step = self._step
     if self._should_reset(step):
       state = None
     if state is not None and reset.any():
-      #mask = tf.cast(1 - reset, self._float)[:, None]
       mask = 1 - reset
-      #state = tf.nest.map_structure(lambda x: x * mask, state)
       for key in state[0].keys():
         for i in range(state[0][key].shape[0]):
           state[0][key][i] *= mask[i]
@@ -94,9 +74,6 @@ class Dreamer(nn.Module):
       for _ in range(steps):
         self._train(next(self._dataset))
       if self._should_log(step):
-        #for name, mean in self._metrics.items():
-        #  self._logger.scalar(name, float(mean.result()))
-        #  mean.reset_states()
         for name, values in self._metrics.items():
           self._logger.scalar(name, float(np.mean(values)))
           self._metrics[name] = []
@@ -107,20 +84,14 @@ class Dreamer(nn.Module):
     policy_output, state = self._policy(obs, state, training)
 
     if training:
-      #self._step.assign_add(len(reset))
       self._step += len(reset)
-      #self._logger.step = self._config.action_repeat \
-      #    * self._step.numpy().item()
       self._logger.step = self._config.action_repeat * self._step
-      #torch.cuda.empty_cache()
     return policy_output, state
 
-  #@tf.function
   def _policy(self, obs, state, training):
     if state is None:
       batch_size = len(obs['image'])
       latent = self._wm.dynamics.initial(len(obs['image']))
-      #action = tf.zeros((batch_size, self._config.num_actions), self._float)
       action = torch.zeros((batch_size, self._config.num_actions)).to(self._config.device)
     else:
       latent, action = state
@@ -133,21 +104,16 @@ class Dreamer(nn.Module):
     if not training:
       actor = self._task_behavior.actor(feat)
       action = actor.mode()
-      #action = actor.mean
     elif self._should_expl(self._step):
       actor = self._expl_behavior.actor(feat)
       action = actor.sample()
     else:
       actor = self._task_behavior.actor(feat)
       action = actor.sample()
-    #logprob = actor.log_prob(tf.cast(action, tf.float32))
     logprob = actor.log_prob(action)
     latent = {k: v.detach()  for k, v in latent.items()}
     action = action.detach()
     if self._config.actor_dist == 'onehot_gumble':
-      #action = tf.cast(
-      #    tf.one_hot(tf.argmax(action, axis=-1), self._config.num_actions),
-      #    action.dtype)
       action = torch.one_hot(torch.argmax(aciton, dim=-1), self._config.num_actions)
     action = self._exploration(action, training)
     policy_output = {'action': action, 'logprob': logprob}
@@ -158,18 +124,14 @@ class Dreamer(nn.Module):
     amount = self._config.expl_amount if training else self._config.eval_noise
     if amount == 0:
       return action
-    #amount = tf.cast(amount, self._float)
     if 'onehot' in self._config.actor_dist:
       probs = amount / self._config.num_actions + (1 - amount) * action
       return tools.OneHotDist(probs=probs).sample()
     else:
-      #return tf.clip_by_value(tfd.Normal(action, amount).sample(), -1, 1)
       return torch.clip(torchd.normal.Normal(action, amount).sample(), -1, 1)
     raise NotImplementedError(self._config.action_noise)
 
-  #@tf.function
   def _train(self, data):
-    #print('Tracing train function.')
     metrics = {}
     post, context, mets = self._wm._train(data)
     metrics.update(mets)
@@ -186,7 +148,6 @@ class Dreamer(nn.Module):
       mets = self._expl_behavior.train(start, context, data)[-1]
       metrics.update({'expl_' + key: value for key, value in mets.items()})
     for name, value in metrics.items():
-      #self._metrics[name].update_state(value)
       if not name in self._metrics.keys():
         self._metrics[name] = [value]
       else:
@@ -198,17 +159,9 @@ def count_steps(folder):
 
 
 def make_dataset(episodes, config):
-  #example = episodes[next(iter(episodes.keys()))]
-  #types = {k: v.dtype for k, v in example.items()}
-  #shapes = {k: (None,) + v.shape[1:] for k, v in example.items()}
-  #generator = lambda: tools.sample_episodes(
-  #    episodes, config.batch_length, config.oversample_ends)
   generator = tools.sample_episodes(
       episodes, config.batch_length, config.oversample_ends)
   dataset = tools.from_generator(generator, config.batch_size)
-  #dataset = tf.data.Dataset.from_generator(generator, types, shapes)
-  #dataset = dataset.batch(config.batch_size, drop_remainder=True)
-  #dataset = dataset.prefetch(10)
   return dataset
 
 
@@ -280,16 +233,6 @@ def main(config):
   config.time_limit //= config.action_repeat
   config.act = getattr(torch.nn, config.act)
 
-  #if config.debug:
-  #  tf.config.experimental_run_functions_eagerly(True)
-  #message = 'No GPU found. To actually train on CPU remove this assert.'
-  #assert tf.config.experimental.list_physical_devices('GPU'), message
-  #if config.gpu_growth:
-  #  for gpu in tf.config.experimental.list_physical_devices('GPU'):
-  #    tf.config.experimental.set_memory_growth(gpu, True)
-  #assert config.precision in (16, 32), config.precision
-  #if config.precision == 16:
-  #  prec.set_policy(prec.Policy('mixed_float16'))
   print('Logdir', logdir)
   logdir.mkdir(parents=True, exist_ok=True)
   config.traindir.mkdir(parents=True, exist_ok=True)
@@ -333,17 +276,14 @@ def main(config):
 
   print('Simulate agent.')
   train_dataset = make_dataset(train_eps, config)
-  #eval_dataset = iter(make_dataset(eval_eps, config))
   eval_dataset = make_dataset(eval_eps, config)
   agent = Dreamer(config, logger, train_dataset).to(config.device)
   agent.requires_grad_(requires_grad=False)
   if (logdir / 'latest_model.pt').exists():
-    #agent.load(logdir / 'variables.pkl')
     agent.load_state_dict(torch.load(logdir / 'latest_model.pt'))
     agent._should_pretrain._once = False
 
   state = None
-  #while agent._step.numpy().item() < config.steps:
   while agent._step < config.steps:
     logger.write()
     print('Start evaluation.')
@@ -353,7 +293,6 @@ def main(config):
     tools.simulate(eval_policy, eval_envs, episodes=1)
     print('Start training.')
     state = tools.simulate(agent, train_envs, config.eval_every, state=state)
-    #agent.save(logdir / 'variables.pkl')
     torch.save(agent.state_dict(), logdir / 'latest_model.pt')
   for env in train_envs + eval_envs:
     try:
