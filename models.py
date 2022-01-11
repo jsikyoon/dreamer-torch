@@ -13,6 +13,7 @@ class WorldModel(nn.Module):
   def __init__(self, step, config):
     super(WorldModel, self).__init__()
     self._step = step
+    self._use_amp = True if config.precision==16 else False
     self._config = config
     self.encoder = networks.ConvEncoder(config.grayscale,
         config.cnn_depth, config.act, config.encoder_kernels)
@@ -50,7 +51,8 @@ class WorldModel(nn.Module):
       assert name in self.heads, name
     self._model_opt = tools.Optimizer(
         'model', self.parameters(), config.model_lr, config.opt_eps, config.grad_clip,
-        config.weight_decay, opt=config.opt)
+        config.weight_decay, opt=config.opt,
+        use_amp=self._use_amp)
     self._scales = dict(
         reward=config.reward_scale, discount=config.discount_scale)
 
@@ -58,24 +60,25 @@ class WorldModel(nn.Module):
     data = self.preprocess(data)
 
     self.requires_grad_(requires_grad=True)
-    embed = self.encoder(data)
-    post, prior = self.dynamics.observe(embed, data['action'])
-    kl_balance = tools.schedule(self._config.kl_balance, self._step)
-    kl_free = tools.schedule(self._config.kl_free, self._step)
-    kl_scale = tools.schedule(self._config.kl_scale, self._step)
-    kl_loss, kl_value = self.dynamics.kl_loss(
-        post, prior, self._config.kl_forward, kl_balance, kl_free, kl_scale)
-    losses = {}
-    likes = {}
-    for name, head in self.heads.items():
-      grad_head = (name in self._config.grad_heads)
-      feat = self.dynamics.get_feat(post)
-      feat = feat if grad_head else feat.detach()
-      pred = head(feat)
-      like = pred.log_prob(data[name])
-      likes[name] = like
-      losses[name] = -torch.mean(like) * self._scales.get(name, 1.0)
-    model_loss = sum(losses.values()) + kl_loss
+    with torch.cuda.amp.autocast(self._use_amp):
+      embed = self.encoder(data)
+      post, prior = self.dynamics.observe(embed, data['action'])
+      kl_balance = tools.schedule(self._config.kl_balance, self._step)
+      kl_free = tools.schedule(self._config.kl_free, self._step)
+      kl_scale = tools.schedule(self._config.kl_scale, self._step)
+      kl_loss, kl_value = self.dynamics.kl_loss(
+          post, prior, self._config.kl_forward, kl_balance, kl_free, kl_scale)
+      losses = {}
+      likes = {}
+      for name, head in self.heads.items():
+        grad_head = (name in self._config.grad_heads)
+        feat = self.dynamics.get_feat(post)
+        feat = feat if grad_head else feat.detach()
+        pred = head(feat)
+        like = pred.log_prob(data[name])
+        likes[name] = like
+        losses[name] = -torch.mean(like) * self._scales.get(name, 1.0)
+      model_loss = sum(losses.values()) + kl_loss
     metrics = self._model_opt(model_loss, self.parameters())
     self.requires_grad_(requires_grad=False)
 
@@ -84,11 +87,12 @@ class WorldModel(nn.Module):
     metrics['kl_free'] = kl_free
     metrics['kl_scale'] = kl_scale
     metrics['kl'] = to_np(torch.mean(kl_value))
-    metrics['prior_ent'] = to_np(torch.mean(self.dynamics.get_dist(prior).entropy()))
-    metrics['post_ent'] = to_np(torch.mean(self.dynamics.get_dist(post).entropy()))
-    context = dict(
-        embed=embed, feat=self.dynamics.get_feat(post),
-        kl=kl_value, postent=self.dynamics.get_dist(post).entropy())
+    with torch.cuda.amp.autocast(self._use_amp):
+      metrics['prior_ent'] = to_np(torch.mean(self.dynamics.get_dist(prior).entropy()))
+      metrics['post_ent'] = to_np(torch.mean(self.dynamics.get_dist(post).entropy()))
+      context = dict(
+          embed=embed, feat=self.dynamics.get_feat(post),
+          kl=kl_value, postent=self.dynamics.get_dist(post).entropy())
     post = {k: v.detach() for k, v in post.items()}
     return post, context, metrics
 
@@ -131,6 +135,7 @@ class ImagBehavior(nn.Module):
 
   def __init__(self, config, world_model, stop_grad_actor=True, reward=None):
     super(ImagBehavior, self).__init__()
+    self._use_amp = True if config.precision==16 else False
     self._config = config
     self._world_model = world_model
     self._stop_grad_actor = stop_grad_actor
@@ -153,7 +158,7 @@ class ImagBehavior(nn.Module):
           feat_size,  # pytorch version
           [], config.value_layers, config.units, config.act)
       self._updates = 0
-    kw = dict(wd=config.weight_decay, opt=config.opt)
+    kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
     self._actor_opt = tools.Optimizer(
         'actor', self.actor.parameters(), config.actor_lr, config.opt_eps, config.actor_grad_clip,
         **kw)
@@ -168,32 +173,34 @@ class ImagBehavior(nn.Module):
     metrics = {}
 
     self.actor.requires_grad_(requires_grad=True)
-    imag_feat, imag_state, imag_action = self._imagine(
-        start, self.actor, self._config.imag_horizon, repeats)
-    reward = objective(imag_feat, imag_state, imag_action)
-    actor_ent = self.actor(imag_feat).entropy()
-    state_ent = self._world_model.dynamics.get_dist(
-        imag_state).entropy()
-    target, weights = self._compute_target(
-        imag_feat, imag_state, imag_action, reward, actor_ent, state_ent,
-        self._config.slow_actor_target)
-    actor_loss, mets = self._compute_actor_loss(
-        imag_feat, imag_state, imag_action, target, actor_ent, state_ent,
-        weights)
-    metrics.update(mets)
-    if self._config.slow_value_target != self._config.slow_actor_target:
+    with torch.cuda.amp.autocast(self._use_amp):
+      imag_feat, imag_state, imag_action = self._imagine(
+          start, self.actor, self._config.imag_horizon, repeats)
+      reward = objective(imag_feat, imag_state, imag_action)
+      actor_ent = self.actor(imag_feat).entropy()
+      state_ent = self._world_model.dynamics.get_dist(
+          imag_state).entropy()
       target, weights = self._compute_target(
           imag_feat, imag_state, imag_action, reward, actor_ent, state_ent,
-          self._config.slow_value_target)
-    value_input = imag_feat
+          self._config.slow_actor_target)
+      actor_loss, mets = self._compute_actor_loss(
+          imag_feat, imag_state, imag_action, target, actor_ent, state_ent,
+          weights)
+      metrics.update(mets)
+      if self._config.slow_value_target != self._config.slow_actor_target:
+        target, weights = self._compute_target(
+            imag_feat, imag_state, imag_action, reward, actor_ent, state_ent,
+            self._config.slow_value_target)
+      value_input = imag_feat
 
     self.value.requires_grad_(requires_grad=True)
-    value = self.value(value_input[:-1].detach())
-    target = torch.stack(target, dim=1)
-    value_loss = -value.log_prob(target.detach())
-    if self._config.value_decay:
-      value_loss += self._config.value_decay * value.mode()
-    value_loss = torch.mean(weights[:-1] * value_loss[:,:,None])
+    with torch.cuda.amp.autocast(self._use_amp):
+      value = self.value(value_input[:-1].detach())
+      target = torch.stack(target, dim=1)
+      value_loss = -value.log_prob(target.detach())
+      if self._config.value_decay:
+        value_loss += self._config.value_decay * value.mode()
+      value_loss = torch.mean(weights[:-1] * value_loss[:,:,None])
 
     metrics['reward_mean'] = to_np(torch.mean(reward))
     metrics['reward_std'] = to_np(torch.std(reward))

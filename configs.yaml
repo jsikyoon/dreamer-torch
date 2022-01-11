@@ -12,8 +12,7 @@ defaults:
   reset_every: 0
   #gpu_growth: True
   device: 'cuda:0'
-  #precision: 16
-  precision: 32
+  precision: 16
   debug: False
   expl_gifs: False
 
