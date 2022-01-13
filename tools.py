@@ -17,6 +17,18 @@ from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 
+class RequiresGrad:
+
+  def __init__(self, model):
+    self._model = model
+
+  def __enter__(self):
+    self._model.requires_grad_(requires_grad=True)
+
+  def __exit__(self, *args):
+    self._model.requires_grad_(requires_grad=False)
+
+
 class TimeRecording:
 
   def __init__(self, comment):
@@ -508,27 +520,26 @@ def static_scan(fn, inputs, start):
     last = fn(last, *inp(index))
     if flag:
       if type(last) == type({}):
-        outputs = last
+        outputs = {key: value.clone().unsqueeze(0) for key, value in last.items()}
       else:
-        outputs = list(last)
+        outputs = []
+        for _last in last:
+          if type(_last) == type({}):
+            outputs.append({key: value.clone().unsqueeze(0) for key, value in _last.items()})
+          else:
+            outputs.append(_last.clone().unsqueeze(0))
       flag = False
     else:
       if type(last) == type({}):
         for key in last.keys():
-          if len(outputs[key].shape) == 2:
-            outputs[key] = outputs[key].unsqueeze(0)
           outputs[key] = torch.cat([outputs[key], last[key].unsqueeze(0)], dim=0)
       else:
         for j in range(len(outputs)):
           if type(last[j]) == type({}):
             for key in last[j].keys():
-              if len(outputs[j][key].shape) == 2:
-                outputs[j][key] = outputs[j][key].unsqueeze(0)
               outputs[j][key] = torch.cat([outputs[j][key],
                   last[j][key].unsqueeze(0)], dim=0)
           else:
-            if len(outputs[j].shape) == 2:
-              outputs[j] = outputs[j].unsqueeze(0)
             outputs[j] = torch.cat([outputs[j], last[j].unsqueeze(0)], dim=0)
   if type(last) == type({}):
     outputs = [outputs]
