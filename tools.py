@@ -17,6 +17,22 @@ from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 
+class TimeRecording:
+
+  def __init__(self, comment):
+    self._comment = comment
+
+  def __enter__(self):
+    self._st = torch.cuda.Event(enable_timing=True)
+    self._nd = torch.cuda.Event(enable_timing=True)
+    self._st.record()
+
+  def __exit__(self, *args):
+    self._nd.record()
+    torch.cuda.synchronize()
+    print(self._comment, self._st.elapsed_time(self._nd)/1000)
+
+
 class Logger:
 
   def __init__(self, logdir, step):
@@ -363,6 +379,24 @@ class TanhBijector(torchd.Transform):
     return 2.0 * (log2 - x - torch.softplus(-2.0 * x))
 
 
+def static_scan_for_lambda_return(fn, inputs, start):
+  last = start
+  indices = range(inputs[0].shape[0])
+  indices = reversed(indices)
+  flag = True
+  for index in indices:
+    inp = lambda x: (_input[x] for _input in inputs)
+    last = fn(last, *inp(index))
+    if flag:
+      outputs = last
+      flag = False
+    else:
+      outputs = torch.cat([outputs, last], dim=-1)
+  outputs = torch.reshape(outputs, [outputs.shape[0], outputs.shape[1], 1])
+  outputs = torch.unbind(outputs, dim=0)
+  return outputs
+
+
 def lambda_return(
     reward, value, pcont, bootstrap, lambda_, axis):
   # Setting lambda=1 gives a discounted Monte Carlo return.
@@ -381,9 +415,13 @@ def lambda_return(
     bootstrap = torch.zeros_like(value[-1])
   next_values = torch.cat([value[1:], bootstrap[None]], 0)
   inputs = reward + pcont * next_values * (1 - lambda_)
-  returns = static_scan(
+  #returns = static_scan(
+  #    lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg,
+  #    (inputs, pcont), bootstrap, reverse=True)
+  # reimplement to optimize performance
+  returns = static_scan_for_lambda_return(
       lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg,
-      (inputs, pcont), bootstrap, reverse=True)
+      (inputs, pcont), bootstrap)
   if axis != 0:
     returns = returns.permute(dims)
   return returns
@@ -461,37 +499,71 @@ def args_type(default):
   return lambda x: parse_string(x) if isinstance(x, str) else parse_object(x)
 
 
-def static_scan(fn, inputs, start, reverse=False):
+def static_scan(fn, inputs, start):
   last = start
-  outputs = [[] for _ in range(len([start] if type(start)==type({}) else start))]
   indices = range(inputs[0].shape[0])
-  if reverse:
-    indices = reversed(indices)
+  flag = True
   for index in indices:
     inp = lambda x: (_input[x] for _input in inputs)
     last = fn(last, *inp(index))
-    [o.append(l) for o, l in zip(outputs, [last] if type(last)==type({}) else last)]
-  if reverse:
-    outputs = [list(reversed(x)) for x in outputs]
-  if type(outputs[0][0]) == type({}):
-    res = [{}] * len(outputs)
-  else:
-    res = [0] * len(outputs)
-  for i in range(len(outputs)):
-    if type(outputs[i][0]) == type({}):
-      _res = {}
-      for key in outputs[i][0].keys():
-        _res[key] = []
-        for j in range(len(outputs[i])):
-          _res[key].append(outputs[i][j][key])
-        _res[key] = torch.stack(_res[key], 0)
+    if flag:
+      if type(last) == type({}):
+        outputs = last
+      else:
+        outputs = list(last)
+      flag = False
     else:
-      _res = []
-      for j in range(len(outputs[i])):
-        _res.append(outputs[i][j])
-      _res = torch.stack(_res, 0)
-    res[i] = _res
-  return res
+      if type(last) == type({}):
+        for key in last.keys():
+          if len(outputs[key].shape) == 2:
+            outputs[key] = outputs[key].unsqueeze(0)
+          outputs[key] = torch.cat([outputs[key], last[key].unsqueeze(0)], dim=0)
+      else:
+        for j in range(len(outputs)):
+          if type(last[j]) == type({}):
+            for key in last[j].keys():
+              if len(outputs[j][key].shape) == 2:
+                outputs[j][key] = outputs[j][key].unsqueeze(0)
+              outputs[j][key] = torch.cat([outputs[j][key],
+                  last[j][key].unsqueeze(0)], dim=0)
+          else:
+            if len(outputs[j].shape) == 2:
+              outputs[j] = outputs[j].unsqueeze(0)
+            outputs[j] = torch.cat([outputs[j], last[j].unsqueeze(0)], dim=0)
+  if type(last) == type({}):
+    outputs = [outputs]
+  return outputs
+
+
+# Original version
+#def static_scan2(fn, inputs, start, reverse=False):
+#  last = start
+#  outputs = [[] for _ in range(len([start] if type(start)==type({}) else start))]
+#  indices = range(inputs[0].shape[0])
+#  if reverse:
+#    indices = reversed(indices)
+#  for index in indices:
+#    inp = lambda x: (_input[x] for _input in inputs)
+#    last = fn(last, *inp(index))
+#    [o.append(l) for o, l in zip(outputs, [last] if type(last)==type({}) else last)]
+#  if reverse:
+#    outputs = [list(reversed(x)) for x in outputs]
+#  res = [[]] * len(outputs)
+#  for i in range(len(outputs)):
+#    if type(outputs[i][0]) == type({}):
+#      _res = {}
+#      for key in outputs[i][0].keys():
+#        _res[key] = []
+#        for j in range(len(outputs[i])):
+#          _res[key].append(outputs[i][j][key])
+#        #_res[key] = torch.stack(_res[key], 0)
+#        _res[key] = faster_stack(_res[key], 0)
+#    else:
+#      _res = outputs[i]
+#      #_res = torch.stack(_res, 0)
+#      _res = faster_stack(_res, 0)
+#    res[i] = _res
+#  return res
 
 
 class Every:
