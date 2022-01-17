@@ -171,8 +171,8 @@ class ImagBehavior(nn.Module):
     self._update_slow_target()
     metrics = {}
 
-    with tools.RequiresGrad(self.actor):
-      with torch.cuda.amp.autocast(self._use_amp):
+    with torch.cuda.amp.autocast(self._use_amp):
+      with tools.RequiresGrad(self.actor):
         imag_feat, imag_state, imag_action = self._imagine(
             start, self.actor, self._config.imag_horizon, repeats)
         reward = objective(imag_feat, imag_state, imag_action)
@@ -192,20 +192,19 @@ class ImagBehavior(nn.Module):
               self._config.slow_value_target)
         value_input = imag_feat
 
-    with tools.RequiresGrad(self.value):
-      with torch.cuda.amp.autocast(self._use_amp):
-        value = self.value(value_input[:-1].detach())
-        target = torch.stack(target, dim=1)
-        value_loss = -value.log_prob(target.detach())
-        if self._config.value_decay:
-          value_loss += self._config.value_decay * value.mode()
-        value_loss = torch.mean(weights[:-1] * value_loss[:,:,None])
+        with tools.RequiresGrad(self.value):
+          value = self.value(value_input[:-1].detach())
+          target = torch.stack(target, dim=1)
+          value_loss = -value.log_prob(target.detach())
+          if self._config.value_decay:
+            value_loss += self._config.value_decay * value.mode()
+          value_loss = torch.mean(weights[:-1] * value_loss[:,:,None])
 
-    metrics['reward_mean'] = to_np(torch.mean(reward))
-    metrics['reward_std'] = to_np(torch.std(reward))
-    metrics['actor_ent'] = to_np(torch.mean(actor_ent))
-    metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
-    metrics.update(self._value_opt(value_loss, self.value.parameters()))
+          metrics['reward_mean'] = to_np(torch.mean(reward))
+          metrics['reward_std'] = to_np(torch.std(reward))
+          metrics['actor_ent'] = to_np(torch.mean(actor_ent))
+          metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
+          metrics.update(self._value_opt(value_loss, self.value.parameters()))
     return imag_feat, imag_state, imag_action, weights, metrics
 
   def _imagine(self, start, policy, horizon, repeats=None):
