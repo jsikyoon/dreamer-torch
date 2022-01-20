@@ -48,7 +48,7 @@ class RSSM(nn.Module):
     self._inp_layers = nn.Sequential(*inp_layers)
 
     if cell == 'gru':
-      self._cell = nn.GRUCell(self._hidden, self._deter)
+      self._cell = GRUCell(self._hidden, self._deter)
     elif cell == 'gru_layer_norm':
       self._cell = GRUCell(self._hidden, self._deter, norm=True)
     else:
