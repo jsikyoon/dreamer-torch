@@ -114,7 +114,7 @@ class Dreamer(nn.Module):
     latent = {k: v.detach()  for k, v in latent.items()}
     action = action.detach()
     if self._config.actor_dist == 'onehot_gumble':
-      action = torch.one_hot(torch.argmax(aciton, dim=-1), self._config.num_actions)
+      action = torch.one_hot(torch.argmax(action, dim=-1), self._config.num_actions)
     action = self._exploration(action, training)
     policy_output = {'action': action, 'logprob': logprob}
     state = (latent, action)
